@@ -1,0 +1,5 @@
+# 测试精确度0.98，攻击完全没有效果
+python test_agr.py --dataset mnist --gpu -1 --net cnn --niter 100 --nworkers 10 --nfake 2 --aggregation median --byz_type poisonedfl --sf 8 --local_epoch 1 --batch_size 32
+
+# TODO: 测试精确度
+python test_agr.py --dataset mnist --gpu -1 --net cnn --niter 1200 --nworkers 100 --nfake 40 --participation_rate 1.0 --aggregation mean --byz_type poisonedfl --sf 30 --local_epoch 1 --batch_size 32 --bias 0.5 --step 50

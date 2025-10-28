@@ -855,6 +855,7 @@ def main(args):
         sf = args.sf
 
         # 生成 PoisonedFL 攻击所需的固定随机方向
+        # fixed_rand随机生成固定方向，保证多轮攻击方向保持一致
         fixed_rand = nd.sign(nd.random.normal(loc=0, scale=1, shape=nd.concat(
             *[xx.reshape((-1, 1)) for xx in init_model], dim=0).shape)).squeeze()
 

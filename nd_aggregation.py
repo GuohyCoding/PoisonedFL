@@ -155,7 +155,9 @@ def median(gradients, net, lr, nfake, byz, history, fixed_rand, init_model, last
         (F) 背景与参考: 参见《Byzantine-robust Distributed Learning》关于中值聚合的分析。
     """
     param_list = [nd.concat(*[xx.reshape((-1, 1)) for xx in x], dim=0) for x in gradients]
-    if byz == byzantine.fang_attack or byz == byzantine.opt_fang:
+    fang_attack = getattr(byzantine, "fang_attack", None)
+    opt_fang = getattr(byzantine, "opt_fang", None)
+    if byz in (fang_attack, opt_fang):
         param_list, sf = byz(param_list, net, lr, nfake, history, fixed_rand, init_model, last_50_model, last_grad, e, sf, "median")
     else:
         param_list, sf = byz(param_list, net, lr, nfake, history, fixed_rand, init_model, last_50_model, last_grad, e, sf)
@@ -445,7 +447,9 @@ def trim(gradients, net, lr, nfake, byz, history, fixed_rand, init_model, last_5
         (F) 背景与参考: 参见《Machine Learning with Adversaries》对截断均值的讨论。
     """
     param_list = [nd.concat(*[xx.reshape((-1, 1)) for xx in x], dim=0) for x in gradients]
-    if byz == byzantine.fang_attack or byz == byzantine.opt_fang:
+    fang_attack = getattr(byzantine, "fang_attack", None)
+    opt_fang = getattr(byzantine, "opt_fang", None)
+    if byz in (fang_attack, opt_fang):
         param_list, sf = byz(param_list, net, lr, nfake, history, fixed_rand, init_model, last_50_model, last_grad, e, sf, "trim")
     else:
         param_list, sf = byz(param_list, net, lr, nfake, history, fixed_rand, init_model, last_50_model, last_grad, e, sf)
