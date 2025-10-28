@@ -11,7 +11,7 @@ import numpy as np
 import byzantine
 import wandb
 from sklearn.metrics import roc_auc_score
-import hdbscan
+# import hdbscan
 
 
 def block_wise_median(param_values):
