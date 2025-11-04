@@ -230,14 +230,26 @@ def simple_mean(gradients, net, lr, nfake, byz, history, fixed_rand, init_model,
         (E) 边界与测试: 易受极端值影响；可验证攻击存在时聚合的偏移程度。
         (F) 背景与参考: 对应 FedAvg 的聚合方式。
     """
-    param_list = [nd.concat(*[xx.reshape((-1, 1)) for xx in x], dim=0) for x in gradients]
+
+    # 用于将向量拉平成一维列向量
+    param_list = [nd.concat(*[xx.reshape((-1, 1)) for xx in x], dim=0) for x in gradients]  
+
+    # 重要：在一维列向量上施加攻击
     param_list, sf = byz(param_list, net, lr, nfake, history, fixed_rand, init_model, last_50_model, last_grad, e, sf)
+
+    # 先把每个客户端的更新展平成列向量param_list，再对这些列向量逐维求中位数得到 global_update 全局梯度向量
+    # *的用法：当函数或方法期望多个位置参数时，写成 func(*param_list) 会把列表中的每个元素依次作为独立参数传入
+    # 这里 nd.concat(*param_list, dim=1) 就等价于 nd.concat(param_list[0], param_list[1], ..., dim=1)
     global_update = nd.mean(nd.concat(*param_list, dim=1), axis=-1)
+
+    # 按照模型参数的排列顺序，从中位数聚合得到的一维大向量中截取对应片段，逐个还原成具体层的更新并应用到网络上。
+    # 循环结束后，全局模型就完成了一次聚合更新。
     idx = 0
     for param in net.collect_params().values():
         size = param.data().size
         param.set_data(param.data() + global_update[idx:idx+size].reshape(param.data().shape))
         idx += size
+
     return param_list, sf
 
 
@@ -288,6 +300,7 @@ def mean_norm(gradients, net, lr, nfake, byz, history, fixed_rand, init_model, l
     param_list = nd.concat(*param_list, dim=1)
     param_norms = nd.norm(param_list, axis=0, keepdims=True)
     nb = nd.sum(param_norms[0, nfake:]) / (len(param_norms[0]) - nfake)
+    
     # 对每列按阈值缩放，限制恶意能量
     param_list = param_list * nd.minimum(param_norms + 1e-7, nb) / (param_norms + 1e-7)
     global_update = nd.mean(param_list, axis=-1)

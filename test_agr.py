@@ -23,6 +23,7 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from utils import *
 import torch
+
 def parse_args():
     """
     简要概述: 构建并解析联邦学习实验的命令行参数集合。
@@ -301,7 +302,8 @@ def get_shapes(dataset):
         (F) 背景与参考: 依赖数据集标准尺寸，可参考各公开数据集描述。
     """
     if dataset == 'FashionMNIST' or dataset == 'mnist':
-        num_inputs = (1, 1, 28, 28)
+        ## (1, 1, 28, 28) = 1张图、1通道、28高、28宽
+        num_inputs = (1, 1, 28, 28)   ## 28x28 的小灰度图, 1（第二个维度）：表示通道数是 1，因为是黑白图像；如果是彩色图像就是 3
         num_outputs = 10
         num_labels = 10
     elif dataset == 'FEMNIST':
@@ -312,7 +314,7 @@ def get_shapes(dataset):
         num_inputs = (1, 3, 32, 32)
         num_outputs = 10
         num_labels = 10
-    elif args.dataset == 'purchase':
+    elif dataset == 'purchase':
         num_inputs = (1, 600)
         num_outputs = 100
         num_labels = 100
@@ -559,6 +561,9 @@ def assign_data(train_data, bias, ctx, num_labels=10, num_workers=100, server_pc
             - 输出: 服务器与客户端数据划分完成，可直接用于本地训练。
         (E) 边界与测试: 需确保总体样本数 ≥ `num_workers`; 建议测试极端 bias=0 与 bias=1 的分布差异。
         (F) 背景与参考: 基于联邦学习常见的非 IID 划分设定，可参见《Measuring the Effects of Non-Identical Data Distribution》。
+
+    注意：
+        在真实的FL环境中，服务器端不需要数据，但是实验中服务器常被赋予一小份“干净数据”，用于验证、检测、调试或防御算法参考
     """
     if dataset == "purchase":
         # purchase 数据集已经按客户端缓存，只需采样服务器份额
@@ -594,15 +599,15 @@ def assign_data(train_data, bias, ctx, num_labels=10, num_workers=100, server_pc
         worker_per_group = num_workers / num_labels
 
         #assign training data to each worker
-        each_worker_data = [[] for _ in range(num_workers)]
+        each_worker_data = [[] for _ in range(num_workers)] # 结果是一个长度为 num_workers 的列表，每个元素都是独立的空列表，用来后续存放各个客户端的数据
         each_worker_label = [[] for _ in range(num_workers)]   
         server_data = []
         server_label = [] 
         
-        # 计算服务器端各标签目标样本数
+        # 计算服务器端各标签目标样本数，先算好服务器要截留的配额（每个标签几条）
         real_dis = [1. / num_labels for _ in range(num_labels)]
         samp_dis = [0 for _ in range(num_labels)]
-        num1 = int(server_pc * p)
+        num1 = int(server_pc * p)  # 先按 p 倾斜给标签 1，剩余均分到其它标签；遍历样本时优先把该标签样本塞满服务器配额
         samp_dis[1] = num1
         average_num = (server_pc - num1) / (num_labels - 1)
         resid = average_num - np.floor(average_num)
@@ -624,6 +629,7 @@ def assign_data(train_data, bias, ctx, num_labels=10, num_workers=100, server_pc
                 x = x.as_in_context(ctx).reshape(1,1,28,28)
                 y = y.as_in_context(ctx)
                 
+                # 基于 bias 的“区间切饼”来决定目标组
                 upper_bound = (y.asnumpy()) * (1. - bias) / (num_labels - 1) + bias
                 lower_bound = (y.asnumpy()) * (1. - bias) / (num_labels - 1)
                 rd = np.random.random_sample()
@@ -635,13 +641,15 @@ def assign_data(train_data, bias, ctx, num_labels=10, num_workers=100, server_pc
                 else:
                     worker_group = y.asnumpy()
                 
+                # 先看服务器配额，能塞服务器就不下发客户端，若该标签 y 的服务器配额还没满，这条样本直接给服务器（做评估/防御用途）。
+                # 服务器优先（按标签配额截留），客户端其次（按 bias → 落组 → 组内均匀随机）
                 if server_counter[int(y.asnumpy())] < samp_dis[int(y.asnumpy())]:
                     server_data.append(x)
                     server_label.append(y)
                     server_counter[int(y.asnumpy())] += 1
                 else:
                     rd = np.random.random_sample()
-                    selected_worker = int(worker_group * worker_per_group + int(np.floor(rd * worker_per_group)))
+                    selected_worker = int(worker_group * worker_per_group + int(np.floor(rd * worker_per_group))) # selected_worker = 组起点 + 组内偏移
                     each_worker_data[selected_worker].append(x)
                     each_worker_label[selected_worker].append(y)
                     
@@ -813,15 +821,15 @@ def main(args):
     batch_size = args.batch_size
     num_inputs, num_outputs, num_labels = get_shapes(args.dataset)
     byz = get_byz(args.byz_type)
-    num_workers = args.nworkers
+    num_workers = args.nworkers  # 参与FL的模拟客户端(workers)数量
     lr = args.lr
     niter = args.niter
 
 
-    with ctx:
+    with ctx:    # with的作用是当块内代码运行完毕，会清理和释放资源（指cpu/gpu）
         net = get_net(args.net, num_outputs)
-
         net.collect_params().initialize(mx.init.Xavier(magnitude=2.24), force_reinit=True, ctx=ctx)
+
         # 定义交叉熵损失作为分类目标
         softmax_cross_entropy = gluon.loss.SoftmaxCrossEntropyLoss()
 
@@ -829,6 +837,7 @@ def main(args):
         test_acc_list = []
 
         # 加载原始训练与测试数据
+        # seed 的作用是使依赖随机数生成器的操作（数据划分、打乱、采样、NumPy 随机函数、MXNet 随机函数等）在不同运行间可复现
         seed = args.seed
         if seed > 0:
             mx.random.seed(seed)
@@ -840,8 +849,10 @@ def main(args):
         server_data, server_label, each_worker_data, each_worker_label = assign_data(
                                                                     train_data, args.bias, ctx, num_labels=num_labels, num_workers=num_workers, 
                                                                     server_pc=args.server_pc, p=args.p, dataset=args.dataset, seed=seed,num_inputs=num_inputs)
-        # 进行一次前向传播，确保参数与缓存被真正初始化
-        data_count = []
+        
+        # 进行一次前向传播，确保参数与缓存被真正初始化，在训练循环开始前做一次“空跑”，确保模型的参数和内部缓存都真正初始化
+        # MXNet 的某些层（比如 BatchNorm、卷积）只有在第一次看到具体输入形状后才会分配内存并初始化状态，如果直接去取梯度可能会碰到“尚未初始化”的错误
+        data_count = []   # data_count并没有被使用！
         for data in each_worker_data:
             data_count.append(data.shape[0])
         net(nd.zeros(num_inputs, ctx=ctx))
@@ -856,7 +867,9 @@ def main(args):
 
         # 生成 PoisonedFL 攻击所需的固定随机方向
         # fixed_rand随机生成固定方向，保证多轮攻击方向保持一致
-        fixed_rand = nd.sign(nd.random.normal(loc=0, scale=1, shape=nd.concat(
+        # 这行代码生成了一个只含 +1 / -1 的向量 fixed_rand，长度等于模型参数总数（把所有层参数按元素拼成一根长向量后的长度）。
+        # 因为这向量只在训练开始前生成一次（且可通过设置随机种子复现），后续每一轮攻击都使用同一个 ±1 向量作为“方向”，所以攻击方向就被“固定”住了
+        fixed_rand = nd.sign(nd.random.normal(loc=0, scale=1, shape=nd.concat(    # 取 sign 后只保留方向信息（每个维度的正/负）
             *[xx.reshape((-1, 1)) for xx in init_model], dim=0).shape)).squeeze()
 
         avg_loss = 0
@@ -867,9 +880,12 @@ def main(args):
                 range(num_workers) , args.participation_rate)
             
             # 根据参与比例估计本轮恶意客户端数量
-            probability = args.nfake * args.participation_rate - int(args.nfake * args.participation_rate)
+            # int()取下整，得到至少要放进来的恶意客户端个数，两者的差是小数部分，也就是“还差多少”才能达到期望值
+            # 随后利用这个小数部分做一次伯努利抽样：以 probability 的概率再多塞 1 个恶意客户端，否则保持整数部分。
+            # 这样一来，长远看来恶意客户端的平均数接近期望值，同时每轮仍是整数
+            probability = args.nfake * args.participation_rate - int(args.nfake * args.participation_rate)  
             if random.random() >= probability:
-                parti_nfake = int(args.nfake * args.participation_rate)
+                parti_nfake = int(args.nfake * args.participation_rate)  # parti_nfake表示一轮恶意客户端数量
             else:
                 parti_nfake = int(args.nfake * args.participation_rate) + 1
             
@@ -877,25 +893,32 @@ def main(args):
             for i in range(parti_nfake):
                 grad_list.append([nd.zeros_like(param.grad().copy()) for param in net.collect_params().values()])
                 
-            # 针对真实客户端执行本地训练并累计梯度
+            # 针对真实客户端执行本地训练并累计梯度，计算当前轮每个客户端的更新压入grad_list
+            # grad_list中前 nfake 个是恶意客户端待篡改的梯度占位，其余部分是所有参与客户端的参数增量，待后续聚合与攻击模块使用。
             for i in participating_clients:
-                ori_para = [param.data().copy() for param in net.collect_params().values()]
-                for _ in range(args.local_epoch):
+                ori_para = [param.data().copy() for param in net.collect_params().values()]  # 先把当前全局参数逐一复制到 ori_para “快照”
+                for _ in range(args.local_epoch):  # 控制本地训练轮数，Iteration 是“全局轮次”，Epoch 是“在客户端本地数据上循环的次数”
+                    # 生成该客户端样本索引的随机排列，模拟随机打乱数据顺序
                     shuffled_order = np.random.choice(list(range(each_worker_data[i].shape[0])), size=each_worker_data[i].shape[0], replace=False)
+                    # 逐个 mini-batch 训练；如果客户端样本少于 batch_size 就退化成整批更新，确保至少执行一次
                     for b_id in range(max(each_worker_data[i].shape[0]//batch_size, 1)):
                         if batch_size >= each_worker_data[i].shape[0]:
                             minibatch = list(range(each_worker_data[i].shape[0]))
                         else:
                             minibatch = shuffled_order[b_id * batch_size: (b_id +1) * batch_size]
                         with autograd.record():
+                            # net() 前向得到输出，再算交叉熵损失
                             output = net(each_worker_data[i][minibatch])
                             loss = softmax_cross_entropy(
                                 output, each_worker_label[i][minibatch])
-                        loss.backward()
-                        avg_loss += sum(loss)/len(loss)
+                        loss.backward() # 执行反向传播，MXNet 会把梯度累积到每个参数的 .grad()
+                        avg_loss += sum(loss)/len(loss) # 统计该客户端本轮的平均损失
+                        # 对 net.collect_params() 中的每个参数执行 SGD 更新
                         for j, (param) in enumerate(net.collect_params().values()):
                             param.set_data(param.data().copy() - lr/batch_size * param.grad().copy())
-                        
+                
+                # 退出本地epoch后，将当前参数与“快照”做差，得到该客户端的模型更新（近似梯度）并压入 grad_list；
+                # 随后把模型权重复原成 ori_para，好让下一位客户端从同一个全局权重开始训练，避免串行干扰
                 grad_list.append([( param.data().copy()- ori_data.copy()) for param, ori_data in zip(net.collect_params().values(), ori_para)])
                 for param, ori_data in zip(net.collect_params().values(), ori_para):
                     param.set_data(ori_data)
@@ -906,6 +929,8 @@ def main(args):
                 pdb.set_trace()
 
             avg_loss = 0
+
+            # 聚合，攻击包含在这部分里
             if not grad_list:
                 continue
             if args.aggregation == "mean":
@@ -922,27 +947,42 @@ def main(args):
                     grad_list, net, lr / batch_size, parti_nfake, byz, history,fixed_rand, init_model, last_50_model, last_grad, sf, e)
             else:
                 raise NotImplementedError
+            
+            # last_grad 记录了上一轮恶意客户端实际提交的平均梯度
             if parti_nfake != 0:
-                if "norm" in args.aggregation:
+                # “norm” 系列聚合器（比如 mean_norm) 会把所有梯度拼成一个 nd.NDArray，维度是 [参数维度, 客户端数]，因此直接用 [:, :parti_nfake] 取前几列并沿列方向求平均
+                if "norm" in args.aggregation: # last_grad 用于下一轮（特别是 PoisonedFL 攻击）计算历史梯度方向和自适应缩放
                     last_grad = nd.mean(return_pare_list[:,:parti_nfake], axis=-1).copy()
-                else:
+                else:  # 返回的是“列表里每个元素一列”的形式，需要先 nd.concat 成矩阵，再对前 parti_nfake 列求平均
                     last_grad = nd.mean(
                         nd.concat(*return_pare_list[:parti_nfake], dim=1), axis=-1).copy()
+                    
             del grad_list
             del return_pare_list
             grad_list = []
+
+            # net.collect_params() 里保存的是服务器维护的全局模型
+            # 在进入客户端循环时，会先把 net.collect_params() 的当前值拷贝到 ori_para 做快照
+            # 计算出本地更新（差值）后，再把参数恢复成快照，这样下一位客户端看到的仍是同一个全局模型
             current_model = [param.data().copy() for param in net.collect_params().values()]
+
+            # e 是迭代轮数
+            # 按设定的步长（默认 1000）打印一次，或在训练快结束的最后 20 轮内也每轮打印一次，以便观测收敛尾部
             if (e + 1) % args.step == 0 or e + 20 >= args.niter:
                 test_accuracy = evaluate_accuracy(test_data, net, ctx)
                 test_acc_list.append(test_accuracy)
                 print("Iteration %02d. Test_acc %0.4f" % (e, test_accuracy))
                 
+            #  每逢 50 轮记录一次 current_model，供 PoisonedFL 攻击和历史统计使用
             if e % 50 == 0:
                 last_50_model = current_model
+
+            # history是current_model - last_model 的串联向量，即本轮全局模型相对上一轮的整体参数增量
+            # history的作用是让poisonedfl从第二轮开始攻击
             history = (nd.concat(*[xx.reshape((-1, 1)) for xx in current_model], dim=0) - nd.concat(*[xx.reshape((-1, 1)) for xx in last_model], dim=0) )
+            # 注：如果直接写成 last_model = current_model，两者就会引用同一份列表对象，无法做上一步的求差
             last_model = [param.data().copy() for param in net.collect_params().values()]
             
-
             from os import path
                 
         del test_acc_list

@@ -166,7 +166,7 @@ def poisonedfl(v, net, lr, nfake, history, fixed_rand, init_model, last_50_model
         时间 O(d + nfake·d); 空间 O(d)，d 为参数总维度。
 
     费曼学习法:
-        (A) 功能: 让恶意客户端沿固定方向推送大幅更新，误导整体模型。
+        (A) 功能: 让恶意客户端沿固定方向推送更新，误导整体模型。
         (B) 类比: 如同在拔河比赛中偷偷安排几人按既定节奏用力，使绳子偏向特定方向。
         (C) 步骤拆解:
             1. 根据参数维度选择经验阈值 `k_95` 和 `k_99`，用来判断攻击与固定方向的对齐程度。
@@ -180,8 +180,12 @@ def poisonedfl(v, net, lr, nfake, history, fixed_rand, init_model, last_50_model
         (E) 边界与测试: `fixed_rand` 需与模型维度一致；若历史为空需预置 NDArray；建议测试在 `aligned_dim_cnt` 接近阈值时缩放因子是否变化。
         (F) 背景与参考: 与模型投毒相关，可参考《Model Poisoning Attacks against Federated Learning》及《Manipulating Byzantine-robust Aggregation》。
     """
-    # 针对不同模型维度预先设定二项分布阈值 k_95 与 k_99
-    if fixed_rand.shape[0] == 1204682:
+    # 针对不同模型维度预先设定二项分布阈值 k_95 与 k_99，根据经验所得，用 k_95、k_99 作为“方向过于一致”的报警阈值
+    # 如果这个一致维度数小于阈值（比如 < k_99），说明攻击方向已经跟随机方向差别很大，容易被识别；此时就把缩放系数 sf 调小（乘 0.7），让攻击收敛得更隐蔽。
+    # 近似计算：np = npq = 1,204,682 × 0.5 = 602,341，标准差 σ = sqrt(n·p·(1-p)) ≈ 548.8。根据正态近似或二项分位数：
+    # 95% 分位对应 μ + 1.645σ ≈ 602,341 + 1.645×548.8 ≈ 603,244
+    # 99% 分位对应 μ + 2.326σ ≈ 602,341 + 2.326×548.8 ≈ 603,618
+    if fixed_rand.shape[0] == 1204682:   # 展平后的网络长度
         k_95 = 603244
         k_99 = 603618
     elif fixed_rand.shape[0] == 139960:
@@ -198,35 +202,46 @@ def poisonedfl(v, net, lr, nfake, history, fixed_rand, init_model, last_50_model
     sf = scaling_factor
 
     # 攻击从第 2 轮开始启用，需要依赖历史梯度
-    if isinstance(history, nd.NDArray):
+    if isinstance(history, nd.NDArray):   # 确认 history 是否是 MXNet 的 NDArray，只有类型匹配才执行后续计算
         # 复制当前模型参数，避免直接修改原始对象
         current_model = [param.data().copy() for param in net.collect_params().values()]
+        # 计算历史增量 history（也就是上一轮全局更新向量）和上一轮梯度 last_grad 的 L2 范数，L2范数的作用是计算更新的幅度（长度）
         history_norm = nd.norm(history)
         last_grad_norm = nd.norm(last_grad)
         # 计算去除上一轮梯度后，历史方向的残差范数
         scale = nd.norm(history - nd.expand_dims(last_grad, axis=-1)* history_norm/(last_grad_norm+1e-9), axis=1)
         # 使用固定随机向量得到最终攻击方向
+        # 除以 nd.norm(scale)+1e-9，实现整体归一化，让 deviation 的范数约等于 1（只有方向信息，不带绝对大小）
         deviation = scale * fixed_rand / (nd.norm(scale)+1e-9)
 
         # 动态计算缩放因子 lambda 以平衡隐蔽性与攻击强度
         if e % 50 == 0:
             # 统计与 50 轮前模型的整体变化，用于检测方向对齐度
+            # 判断长期方向是否与固定随机方向一致，从而调节缩放系数，让攻击既保持连贯又不过分显眼
             total_update = nd.concat(*[xx.reshape((-1, 1)) for xx in current_model],
                                 dim=0) - nd.concat(*[xx.reshape((-1, 1)) for xx in last_50_model], dim=0)
+            
             # 若存在零增量，使用当前模型参数替代以避免除零
+            # nd.where(mask, A, B) 是 MXNet 的按元素条件选择：mask 为真就取 A 中对应元素，否则取 B
+            # 向量中有些维度可能是 0（表示 50 轮间这个参数没有整体变化）。若直接对这些 0 求符号，会得到 0，既不算正也不算负
+            # 于是用零位置用当前模型参数值替换，这样即便某维度累计增量为 0，也能借用当前参数值（其符号反映了当前权重的方向）来参与比较
             total_update = nd.where(total_update == 0, nd.concat(*[xx.reshape((-1, 1)) for xx in current_model],dim=0), total_update)
-            current_sign = nd.sign(total_update)
+            current_sign = nd.sign(total_update)   # 对每个元素取符号：正数变 1，负数变 -1，零保持 0
+
             # 统计与固定随机方向符号一致的维度数，判断攻击是否显眼
             aligned_dim_cnt = (current_sign == nd.expand_dims(fixed_rand, axis=-1)).sum()
             if aligned_dim_cnt < k_99 and scaling_factor*0.7>=0.5:
                 sf = scaling_factor*0.7
             else:
                 sf = scaling_factor
-            lamda_succ = sf * history_norm
+            lamda_succ = sf * history_norm   # lamda_succ 得到本轮更新的总体幅度（记作 λ）
         else:
             sf = scaling_factor
             lamda_succ = sf * history_norm
-        mal_update = lamda_succ * deviation
+
+        # 把单位方向向量 deviation 拉成目标强度，从而控制攻击能量
+        mal_update = lamda_succ * deviation   
+        
         for i in range(nfake):
             # 将同一恶意向量广播给所有攻击客户端
             v[i] = nd.expand_dims(mal_update, axis=-1)
@@ -335,3 +350,4 @@ poisonedfl: 沿固定随机方向构造放大的恶意更新误导聚合。
 random_attack: 向恶意客户端注入高斯噪声扰乱训练。
 init_attack: 沿初始模型方向拖拽训练进程的投毒策略。
 """
+
